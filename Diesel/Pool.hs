@@ -1,41 +1,82 @@
-{-# LANGUAGE BangPattern #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
-module Diesel.Pool where
+{-|
+Module      : Diesel.Pool
+Description : A high performance resource pool
+Copyright   : (c) Winterland, 2017
+License     : BSD
+Maintainer  : drkoster@qq.com
+Stability   : experimental
+Portability : PORTABLE
 
-import Data.Vector
-import Data.IORef
-import Data.Atomics.Counter
-import qualified Control.Exception as E
+This module provide a high performance resource pool, the difference from
+<resource-pool http://hackage.haskell.org/package/resource-pool> package is as following:
 
-data TimeoutException = TimeoutException
+  * Use 'MVar' instead of 'TVar' to achieve blocking, since 'MVar' has a nice one-thread wake
+    property.
+
+  * Instead of using system time as time source, we use 'AtomicCounter' from <atomic-primops
+    http://hackage.haskell.org/package/atomic-primops> to track time, this will not affect
+    precision because the reaper thread is still running at a fixed rate(once per second).
+
+  * Provide built-in timeout for thread holding a resource, this will make a lot of
+    operation easier and guarantee the pool will not be locked by its workers.
+
+  * Provide 'closePool' to clean resources instead of relying on 'Weak' finalizers.
+
+-}
+
+module Diesel.Pool
+    ( TimeoutException
+    , Pool
+    , createPool
+    , purgePool
+    , closePool
+    , withResource
+    ) where
+
+import           Control.Concurrent
+import           Control.Concurrent.MVar
+import qualified Control.Exception       as E
+import           Control.Monad
+import           Data.Atomics.Counter
+import           Data.IORef
+import           Data.Typeable
+import qualified Data.Vector             as V
+
+data TimeoutException = TimeoutException deriving (Typeable, Show)
+
+instance E.Exception TimeoutException
 
 data Worker = Worker
-    { workerRef    :: {-# UNPACK #-} !(IORef (Maybe ThreadId))
-    , startTime    :: {-# UNPACK #-} !Int
+    { workerRef :: {-# UNPACK #-} !(IORef (Maybe ThreadId))
+    , startTime :: {-# UNPACK #-} !Int
     }
 
 data Entry a = Entry
-    { entry :: a
+    { entry        :: a
     , lastUsedTime :: {-# UNPACK #-} !Int
     }
 
 data Pool a = Pool
-    {   stripNum           :: Int
-    ,   poolTimer          :: AtomicCounter
-    ,   maxResPerLocalPool :: Int
-    ,   resourceTimeout    :: Int
-    ,   workerTimeout      :: Int
-    ,   localPools         :: V.Vector LocalPool
-    ,   create             :: IO a
-    ,   destroy            :: a -> IO ()
-    ,   reaperThreadId     :: {-# UNPACK #-} !(IORef (Maybe ThreadId))
+    { stripNum           :: {-# UNPACK #-} !Int
+    , maxResPerLocalPool :: {-# UNPACK #-} !Int
+    , resourceTimeout    :: {-# UNPACK #-} !Int
+    , workerTimeout      :: {-# UNPACK #-} !Int
+    , localPools         :: {-# UNPACK #-} !(V.Vector (LocalPool a))
+    , reaperThreadId     :: {-# UNPACK #-} !(IORef (Maybe ThreadId))
+    , poolTimer          :: {-# UNPACK #-} !AtomicCounter
+    , create             :: IO a
+    , destroy            :: a -> IO ()
     }
 
 data LocalPool a = LocalPool
-    {   resCounter     :: AtomicCounter
-    ,   resourceList   :: IORef [a]
-    ,   resourceLock   :: MVar a
-    ,   workerList     :: IORef [Worker]
+    { resCounter   :: {-# UNPACK #-} !AtomicCounter
+    , resourceList :: {-# UNPACK #-} !(IORef [Entry a])
+    , resourceLock :: {-# UNPACK #-} !(MVar (Entry a))
+    , workerList   :: {-# UNPACK #-} !(IORef [Worker])
     }
 
 -- | Try to acquire a resource from pool and do some work within given time, then put it back.
@@ -52,24 +93,131 @@ withResource :: Pool a        -- ^ The resource pool
              -> Int           -- ^ Timeout
              -> (a -> IO b)   -- ^ the work to do
              -> IO b
-withResource pool@Pool{..} timeout act = mask $ \ restore -> do
-    (a, local) <- takeResource pool
+withResource Pool{..} timeout act = E.mask $ \ restore -> do
+    tid <- myThreadId
+    (cap, _) <- threadCapability tid
+    let LocalPool{..} = localPools V.! (cap `mod` stripNum)
+    -- first try to get resource from resource list,
+    -- try to take the locked resource only if the list is empty.
+    r <- E.bracket
+        (atomicModifyIORef' resourceList $ \ es ->
+            case es of e:es' -> (es', Just e)
+                       []    -> ([], Nothing))
+        (\ me -> case me of
+            Just e -> do
+                unlock <- tryPutMVar resourceLock e
+                unless unlock $ atomicModifyIORef resourceList (\ es -> (e:es, ()))
+            Nothing -> return ())
+        (\ me -> do
+            case me of
+                Just Entry{..} -> return entry
+                Nothing -> E.bracketOnError (incrCounter 1 resCounter)
+                    (\ count -> when (count > maxResPerLocalPool) (incrCounter_ (-1) resCounter))
+                    (\ count ->
+                        if count > maxResPerLocalPool
+                        then entry <$> takeMVar resourceLock
+                        else create))
+
+    -- put worker into worker list
+    workerRef <- newIORef (Just tid)
+    startTime <- readCounter poolTimer
+    let w = Worker{workerRef, startTime}
+    atomicModifyIORef workerList $ \ ws -> (w:ws, ())
+
     -- E.onException will re-throw any exception it capture
-    ret <- restore (act resource) `E.onException` destroyResource pool local resource
+    ret <- restore (act r) `E.onException` (do
+        -- let's remove worker from worker list first
+        -- so that we won't receive new 'TimeoutException'.
+        atomicWriteIORef workerRef Nothing
+        E.catch (destroy r) $ \ (_ :: E.SomeException) -> return ()
+        incrCounter_ (-1) resCounter)
+
+    -- put resource back
     now <- readCounter poolTimer
-    putResource local (Entry resource now)
+    let e = Entry r now
+    unlock <- tryPutMVar resourceLock e
+    unless unlock $ atomicModifyIORef resourceList (\ es -> (e:es, ()))
     return ret
 
-createPool :: Int     -- ^ The number of stripes (distinct sub-pools) to maintain.
-                      -- The smallest acceptable value is 1.
-           -> Int     -- ^ Maximum number of resource to keep open per stripe.  The
-                      -- smallest acceptable value is 1.
-           -> Int     -- ^ Amount of seconds between each run of reaper
-           -> IO a
-           -> IO Pool
-createPool stripNum maxResPerLocalPool = do
+createPool :: IO a  -- ^ Action that creates a new resource.
+           -> (a -> IO ()) -- ^ Action that destroys an existing resource.
+           -> Int   -- ^ The number of stripes (distinct sub-pools) to maintain.
+                    -- The smallest acceptable value is 1.
+           -> Int   -- ^ Maximum number of resources to keep open per stripe.
+                    -- The smallest acceptable value is 1.
+           -> Int   -- Amount of seconds for which an unused resource is kept open.
+                    -- The smallest acceptable value is 1.
+           -> Int   -- ^ Maximum seconds a thread can hold a resource.
+                    -- The smallest acceptable value is 1.
+           -> IO (Pool a)
+createPool create destroy stripNum maxResPerLocalPool resourceTimeout workerTimeout = do
+    when (stripNum < 1) $
+        error $ "Diesel.Pool.createPool: invalid stripe count " ++ show stripNum
+    when (maxResPerLocalPool < 1) $
+        error $ "Diesel.Pool.createPool: invalid maximum resource count " ++ show maxResPerLocalPool
+    when (resourceTimeout < 1) $
+        error $ "Diesel.Pool.createPool: invalid resource timeout " ++ show resourceTimeout
+    when (workerTimeout < 1) $
+        error $ "Diesel.Pool.createPool: invalid worker timeout " ++ show workerTimeout
+    localPools <- V.replicateM stripNum $
+        LocalPool <$> newCounter 0 <*> newIORef [] <*> newEmptyMVar <*> newIORef []
+    poolTimer <- newCounter 0
+    reaperThreadId <- newIORef . Just =<< forkIO
+        (reaper resourceTimeout workerTimeout poolTimer localPools destroy)
+    return $ Pool
+        { stripNum
+        , maxResPerLocalPool
+        , resourceTimeout
+        , workerTimeout
+        , localPools
+        , reaperThreadId
+        , poolTimer
+        , create
+        , destroy
+        }
+  where
+    reaper resourceTimeout workerTimeout poolTimer localPools destroy = forever $ do
+        threadDelay 1000000
+        now <- incrCounter 1 poolTimer
+        V.forM_ localPools $ \ LocalPool{..} -> do
+            -- swap an empty list
+            ws <- atomicModifyIORef workerList (\ ws -> ([], ws))
+            -- scan worker list and throw exception to timeout workers
+            ws' <- foldM (\ acc w@Worker{..} -> do
+                wid <- readIORef workerRef
+                case wid of
+                    Just wid' ->
+                        if startTime + resourceTimeout < now
+                        then throwTo wid' TimeoutException >> return acc
+                        else return (w:acc)
+                    Nothing -> return acc
+                ) [] ws
+            -- merge current worker list
+            -- the list thunk will be traversed in next scan
+            atomicModifyIORef workerList (\ ws -> (ws ++ ws', ()))
 
-purgePool:: Pool -> IO ()
+            -- take the lock first
+            r <- tryTakeMVar resourceLock
+            case r of
+                -- let's scan idle resource
+                Just r -> do
+                    -- swap an empty list
+                    rs <- atomicModifyIORef' resourceList $ \ rs -> ([], rs)
+                    forM_ (r:rs) $ \ e@Entry{..} ->
+                        if lastUsedTime + resourceTimeout < now
+                        then do
+                            E.catch (destroy entry) $ \ (_ :: E.SomeException) -> return ()
+                            incrCounter_ (-1) resCounter
+                        else do
+                            unlock <- tryPutMVar resourceLock e
+                            unless unlock $ atomicModifyIORef resourceList (\ es -> (e:es, ()))
+                -- all resource are in used, let's scan idle resource later
+                Nothing -> return ()
+
+
+-- | Destroy all idle resource
+--
+purgePool:: Pool a -> IO ()
 purgePool Pool{..} = V.forM_ localPools purgeLocalPool
   where
     purgeLocalPool LocalPool{..} = do
@@ -77,91 +225,32 @@ purgePool Pool{..} = V.forM_ localPools purgeLocalPool
         r <- tryTakeMVar resourceLock
         rs <- atomicModifyIORef' resourceList $ \ rs -> ([], rs)
         let rs' = maybe rs (:rs) r
-            !len = length rs'
-        writeCounter resCounter len
-        forM_ rs' $ \ r ->
-            destroy resource `E.catch` \ (_ :: E.SomeException) -> return ()
+        forM_ rs' $ \ Entry{..} -> do
+            E.catch (destroy entry) $ \ (_ :: E.SomeException) -> return ()
+            incrCounter_ (-1) resCounter
 
-
-closePool :: Pool -> IO ()
+-- | Clean up all resources.
+--
+-- This function will block until all resource are returned and destroyed, so please make
+-- sure no thread is try to acquire resources, and you should expect all resources
+-- would be cleaned up within worker timeout, eg. the maximum time a resource can be held.
+--
+closePool :: Pool a -> IO ()
 closePool p@Pool{..} = do
-    purgePool p
-
-
---------------------------------------------------------------------------------
--- Internal
---------------------------------------------------------------------------------
-
-reaper :: Int -> Pool{..} -> IO ()
-reaper delay pool = forever $
-    threadDelay (delay * 1000000)
-    now <- incrCounter 1 poolTimer
-    V.forM_ localPools $ \ lp@LocalPool{..} -> do
-        -- swap an empty list
-        ws <- atomicWriteIORef workerList $ \ ws -> ([], ws)
-        -- scan worker list and throw exception to timeout workers
-        ws' <- foldM (\ acc Worker{..} ->
-            w <- workerRef
-            case w of
-                Just tid ->
-                    if startTime + expireTime < now
-                    then throwTo tid TimeoutException >> return acc
-                    else return (w:acc)
-                Nothing -> return acc
-        ) [] ws
-        -- merge current worker list
-        -- the list thunk will be traversed in next scan
-        atomicWriteIORef workerList $ \ ws -> (ws ++ ws', ())
-
-        -- take the lock first
-        r <- tryTakeMVar resourceLock
-        case r of
-            -- let's scan idle resource
-            Just r ->
-                -- swap an empty list
-                rs <- atomicModifyIORef' resourceList $ \ rs -> ([], rs)
-                forM_ (r:rs) $ \ r@Entry{..} ->
-                    if lastUsedTime + resourceTimeout < now
-                    then destroyResource pool lp entry
-                    else putResource lp r
-            -- all resource are in used, let's scan idle resource later
-            Nothing -> return ()
-
-
--- first try to unlock waiting thread with resource,
--- put back to resource list only if put fail.
---
-putResource :: LocalPool a -> Entry a -> IO ()
-putResource LocalPool{..} r = do
-    unlock <- tryPutMVar resourceLock r
-    unless unlock $ atomicModifyIORef resourceList (\ rs -> (r:rs, ()))
-{-# INLINABLE putResource #-}
-
--- Destroy a resource. Note that this will ignore any exceptions in the
--- destroy function.
---
-destroyResource :: Pool a -> LocalPool a -> a -> IO ()
-destroyResource Pool{..} LocalPool{..} resource = do
-    destroy resource `E.catch` \(_::SomeException) -> return ()
-    incrCounter (-1) resCounter
-{-# INLINABLE destroyResource #-}
-
-takeResource :: Pool a -> (a, LocalPool a)
-takeResource Pool{..} act = do
-    tid <- myThreadId
-    tidRef <- newIORef (Just tid)
-    let lp@LocalPool{..} = localPools  V.! (tid `mod` stripNum)
-    -- first try to get resource from resource list,
-    -- try to take the locked resource only if the list is empty.
-    r <- atomicModifyIORef' resourceList $ \ rs ->
-        case rs of r:rs' -> (rs', Just r)
-                   []    -> ([], Nothing)
-    case r of
-        Just r' -> return r'
-        Nothing -> bracketOnError (incrCounter 1 resCounter)
-            (\ count -> when (count > maxResNum) (incrCounter (-1) resCounter))
-            (\ count ->
-                if count > maxResNum
-                then takeMVar resourceLock
-                else create)
-{-# INLINABLE takeResource #-}
+    V.forM_ localPools closeLocalPool
+    rid <- readIORef reaperThreadId
+    writeIORef reaperThreadId Nothing
+    case rid of Just rid' -> killThread rid'
+                _ -> return ()
+  where
+    closeLocalPool lp@LocalPool{..} = do
+        remaining <- readCounter resCounter
+        when (remaining > 0) $ do
+            r <- tryTakeMVar resourceLock
+            rs <- atomicModifyIORef' resourceList $ \ rs -> ([], rs)
+            let rs' = maybe rs (:rs) r
+            forM_ rs' $ \ Entry{..} -> do
+                E.catch (destroy entry) $ \ (_ :: E.SomeException) -> return ()
+                incrCounter_ (-1) resCounter
+            -- continue until we close all resource
+            closeLocalPool lp
